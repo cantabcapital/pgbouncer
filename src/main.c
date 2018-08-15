@@ -152,6 +152,7 @@ char *cf_client_tls_key_file;
 char *cf_client_tls_ciphers;
 char *cf_client_tls_dheparams;
 char *cf_client_tls_ecdhecurve;
+int cf_client_tls_compression;
 
 int cf_server_tls_sslmode;
 char *cf_server_tls_protocols;
@@ -159,6 +160,7 @@ char *cf_server_tls_ca_file;
 char *cf_server_tls_cert_file;
 char *cf_server_tls_key_file;
 char *cf_server_tls_ciphers;
+int cf_server_tls_compression;
 
 /*
  * config file description
@@ -283,6 +285,19 @@ CF_ABS("client_tls_protocols", CF_STR, cf_client_tls_protocols, CF_NO_RELOAD, "a
 CF_ABS("client_tls_ciphers", CF_STR, cf_client_tls_ciphers, CF_NO_RELOAD, "fast"),
 CF_ABS("client_tls_dheparams", CF_STR, cf_client_tls_dheparams, CF_NO_RELOAD, "auto"),
 CF_ABS("client_tls_ecdhcurve", CF_STR, cf_client_tls_ecdhecurve, CF_NO_RELOAD, "auto"),
+
+// "TLS Compression is dangerous and should be avoided on the public internet. It is disabled by
+// default in OpenSSL 1.1.0 and later, but needs to be explicitly disabled for earlier releases."
+// https://jira.mongodb.org/browse/CDRIVER-1369
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+	// Disable compression by default, to match OpenSSL defaults
+	CF_ABS("client_tls_compression", CF_INT, cf_client_tls_compression, CF_NO_RELOAD, "0"),
+	CF_ABS("server_tls_compression", CF_INT, cf_server_tls_compression, CF_NO_RELOAD, "0"),
+#else
+	// Enable (don't disable) compression by default, to match OpenSSL defaults
+	CF_ABS("client_tls_compression", CF_INT, cf_client_tls_compression, CF_NO_RELOAD, "1"),
+	CF_ABS("server_tls_compression", CF_INT, cf_server_tls_compression, CF_NO_RELOAD, "1"),
+#endif
 
 CF_ABS("server_tls_sslmode", CF_LOOKUP(sslmode_map), cf_server_tls_sslmode, CF_NO_RELOAD, "disable"),
 CF_ABS("server_tls_ca_file", CF_STR, cf_server_tls_ca_file, CF_NO_RELOAD, ""),

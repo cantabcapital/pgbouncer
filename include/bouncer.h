@@ -475,6 +475,7 @@ extern char *cf_client_tls_key_file;
 extern char *cf_client_tls_ciphers;
 extern char *cf_client_tls_dheparams;
 extern char *cf_client_tls_ecdhecurve;
+extern int cf_client_tls_compression;
 
 extern int cf_server_tls_sslmode;
 extern char *cf_server_tls_protocols;
@@ -482,6 +483,7 @@ extern char *cf_server_tls_ca_file;
 extern char *cf_server_tls_cert_file;
 extern char *cf_server_tls_key_file;
 extern char *cf_server_tls_ciphers;
+extern int cf_server_tls_compression;
 
 extern const struct CfLookup pool_mode_map[];
 

@@ -964,6 +964,7 @@ void sbuf_tls_setup(void)
 			  cf_server_tls_protocols, cf_server_tls_ciphers,
 			  cf_server_tls_key_file, cf_server_tls_cert_file,
 			  cf_server_tls_ca_file, "", "", true);
+		tls_config_set_compression(server_connect_conf, cf_server_tls_compression);
 	}
 
 	if (cf_client_tls_sslmode != SSLMODE_DISABLED) {
@@ -975,6 +976,7 @@ void sbuf_tls_setup(void)
 			  cf_client_tls_key_file, cf_client_tls_cert_file,
 			  cf_client_tls_ca_file, cf_client_tls_dheparams,
 			  cf_client_tls_ecdhecurve, false);
+		tls_config_set_compression(client_accept_conf, cf_client_tls_compression);
 
 		client_accept_base = tls_server();
 		if (!client_accept_base)
@@ -983,6 +985,16 @@ void sbuf_tls_setup(void)
 		if (err)
 			die("TLS setup failed: %s", tls_error(client_accept_base));
 	}
+}
+
+void sbuf_tls_set_server_compression(int new_value)
+{
+	tls_config_set_compression(server_connect_conf, new_value);
+}
+
+void sbuf_tls_set_client_compression(int new_value)
+{
+	tls_config_set_compression(client_accept_conf, new_value);
 }
 
 /*

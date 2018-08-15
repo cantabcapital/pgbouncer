@@ -97,6 +97,8 @@ bool sbuf_accept(SBuf *sbuf, int read_sock, bool is_unix)  _MUSTCHECK;
 bool sbuf_connect(SBuf *sbuf, const struct sockaddr *sa, int sa_len, int timeout_sec)  _MUSTCHECK;
 
 void sbuf_tls_setup(void);
+void sbuf_tls_set_server_compression(int new_value);
+void sbuf_tls_set_client_compression(int new_value);
 bool sbuf_tls_accept(SBuf *sbuf)  _MUSTCHECK;
 bool sbuf_tls_connect(SBuf *sbuf, const char *hostname)  _MUSTCHECK;
 
