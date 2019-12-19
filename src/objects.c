@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "scram.h"
 
 /* those items will be allocated as needed, never freed */
 STATLIST(user_list);
@@ -32,7 +33,7 @@ struct AATree user_tree;
 
 /*
  * All PAM users are kept here. We need to differentiate two user
- * lists to avoid user clashing for different authorization types,
+ * lists to avoid user clashing for different authentication types,
  * and because pam_user_tree is closer to PgDatabase.user_tree in
  * logic.
  */
@@ -442,7 +443,8 @@ PgUser *add_pam_user(const char *name, const char *passwd)
 		aatree_insert(&pam_user_tree, (uintptr_t)user->name, &user->tree_node);
 		user->pool_mode = POOL_INHERIT;
 	}
-	safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
+	if (passwd)
+		safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
 	return user;
 }
 
@@ -580,7 +582,7 @@ void activate_client(PgSocket *client)
 }
 
 /*
- * Don't let clients queue at all, if there is no working server connection.
+ * Don't let clients queue at all if there is no working server connection.
  *
  * It must still allow following cases:
  * - empty pool on startup
@@ -591,22 +593,35 @@ void activate_client(PgSocket *client)
  * - new server connections fail due to server_connect_timeout, or other failure
  *
  * So here we drop client if all server connections have been dropped
- * and new one's fail.
+ * and new ones fail.
+ *
+ * Return true if the client connection should be allowed, false if it
+ * should be rejected.
  */
 bool check_fast_fail(PgSocket *client)
 {
 	int cnt;
 	PgPool *pool = client->pool;
 
-	/* reject if no servers are available and the last login failed */
+	/* If last login succeeded, client can go ahead. */
 	if (!pool->last_login_failed)
 		return true;
+
+	/* If there are servers available, client can go ahead. */
 	cnt = pool_server_count(pool) - statlist_count(&pool->new_server_list);
 	if (cnt)
 		return true;
+
+	/* Else we fail the client. */
 	disconnect_client(client, true, "pgbouncer cannot connect to server");
 
-	/* usual relaunch won't work, as there are no waiting clients */
+	/*
+	 * Try to launch a new connection.  (launch_new_connection()
+	 * will check for server_login_retry etc.)  The usual relaunch
+	 * from janitor.c won't do anything, as there are no waiting
+	 * clients, so we need to do it here to get any new servers
+	 * eventually.
+	 */
 	launch_new_connection(pool);
 
 	return false;
@@ -862,15 +877,16 @@ void disconnect_server(PgSocket *server, bool notify, const char *reason, ...)
 
 	/* notify server and close connection */
 	if (send_term && notify) {
-		if (!sbuf_answer(&server->sbuf, pkt_term, sizeof(pkt_term)))
-			/* ignore result */
-			notify = false;
+		bool _ignore = sbuf_answer(&server->sbuf, pkt_term, sizeof(pkt_term));
+		(void) _ignore;
 	}
 
 	if (server->dns_token) {
 		adns_cancel(adns, server->dns_token);
 		server->dns_token = NULL;
 	}
+
+	free_scram_state(&server->scram_state);
 
 	server->pool->db->connection_count--;
 	server->pool->user->connection_count--;
@@ -928,6 +944,8 @@ void disconnect_client(PgSocket *client, bool notify, const char *reason, ...)
 		 */
 		send_pooler_error(client, false, reason);
 	}
+
+	free_scram_state(&client->scram_state);
 
 	change_client_state(client, CL_JUSTFREE);
 	if (!sbuf_close(&client->sbuf))
@@ -1131,7 +1149,8 @@ enum LaunchResult launch_new_connection(PgPool *pool)
 	if (pool->last_connect_failed) {
 		usec_t now = get_cached_time();
 		if (now - pool->last_connect_time < cf_server_login_retry) {
-			log_debug("launch_new_connection: last failed, wait");
+			log_debug("launch_new_connection: last failed, not launching new connection yet, still waiting %" PRIu64 " s",
+				  (cf_server_login_retry - (now - pool->last_connect_time)) / USEC);
 			return LAUNCH_RETRY_WAIT;
 		}
 	}

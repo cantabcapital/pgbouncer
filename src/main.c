@@ -32,20 +32,23 @@
 #include <sys/resource.h>
 #endif
 
-static const char usage_str[] =
-"Usage: %s [OPTION]... config.ini\n"
-"  -d, --daemon           Run in background (as a daemon)\n"
-"  -R, --restart          Do an online restart\n"
-"  -q, --quiet            Run quietly\n"
-"  -v, --verbose          Increase verbosity\n"
-"  -u, --user=<username>  Assume identity of <username>\n"
-"  -V, --version          Show version\n"
-"  -h, --help             Show this help screen and exit\n";
-
-static void usage(int err, char *exe)
+static void usage(const char *exe)
 {
-	printf(usage_str, basename(exe));
-	exit(err);
+	printf("%s is a connection pooler for PostgreSQL.\n\n", exe);
+	printf("Usage:\n");
+	printf("  %s [OPTION]... CONFIG_FILE\n", exe);
+	printf("\nOptions:\n");
+	printf("  -d, --daemon         run in background (as a daemon)\n");
+	printf("  -q, --quiet          run quietly\n");
+	printf("  -R, --restart        do an online restart\n");
+	printf("  -u, --user=USERNAME  assume identity of USERNAME\n");
+	printf("  -v, --verbose        increase verbosity\n");
+	printf("  -V, --version        show version, then exit\n");
+	printf("  -h, --help           show this help, then exit\n");
+	printf("\n");
+	printf("Report bugs to: %s\n", PACKAGE_BUGREPORT);
+	printf("%s home page: <%s>\n", PACKAGE_NAME, PACKAGE_URL);
+	exit(0);
 }
 
 /* async dns handler */
@@ -76,6 +79,7 @@ int cf_pool_mode = POOL_SESSION;
 /* sbuf config */
 int cf_sbuf_len;
 int cf_sbuf_loopcnt;
+int cf_so_reuseport;
 int cf_tcp_socket_buffer;
 #if defined(TCP_DEFER_ACCEPT) || defined(SO_ACCEPTFILTER)
 int cf_tcp_defer_accept = 1;
@@ -111,6 +115,7 @@ int cf_disable_pqexec;
 usec_t cf_dns_max_ttl;
 usec_t cf_dns_nxdomain_ttl;
 usec_t cf_dns_zone_check_period;
+char *cf_resolv_conf;
 unsigned int cf_max_packet_size;
 
 char *cf_ignore_startup_params;
@@ -178,6 +183,7 @@ static const struct CfLookup auth_type_map[] = {
 #ifdef HAVE_PAM
 	{ "pam", AUTH_PAM },
 #endif
+	{ "scram-sha-256", AUTH_SCRAM_SHA_256 },
 	{ NULL }
 };
 
@@ -208,6 +214,7 @@ CF_ABS("logfile", CF_STR, cf_logfile, 0, ""),
 CF_ABS("pidfile", CF_STR, cf_pidfile, CF_NO_RELOAD, ""),
 CF_ABS("listen_addr", CF_STR, cf_listen_addr, CF_NO_RELOAD, ""),
 CF_ABS("listen_port", CF_INT, cf_listen_port, CF_NO_RELOAD, "6432"),
+CF_ABS("so_reuseport", CF_INT, cf_so_reuseport, CF_NO_RELOAD, "0"),
 CF_ABS("listen_backlog", CF_INT, cf_listen_backlog, CF_NO_RELOAD, "128"),
 #ifndef WIN32
 CF_ABS("unix_socket_dir", CF_STR, cf_unix_socket_dir, CF_NO_RELOAD, "/tmp"),
@@ -257,6 +264,7 @@ CF_ABS("disable_pqexec", CF_INT, cf_disable_pqexec, CF_NO_RELOAD, "0"),
 CF_ABS("dns_max_ttl", CF_TIME_USEC, cf_dns_max_ttl, 0, "15"),
 CF_ABS("dns_nxdomain_ttl", CF_TIME_USEC, cf_dns_nxdomain_ttl, 0, "15"),
 CF_ABS("dns_zone_check_period", CF_TIME_USEC, cf_dns_zone_check_period, 0, "0"),
+CF_ABS("resolv_conf", CF_STR, cf_resolv_conf, CF_NO_RELOAD, ""),
 
 CF_ABS("max_packet_size", CF_UINT, cf_max_packet_size, 0, "2147483647"),
 CF_ABS("pkt_buf", CF_INT, cf_sbuf_len, CF_NO_RELOAD, "4096"),
@@ -281,7 +289,7 @@ CF_ABS("client_tls_sslmode", CF_LOOKUP(sslmode_map), cf_client_tls_sslmode, CF_N
 CF_ABS("client_tls_ca_file", CF_STR, cf_client_tls_ca_file, CF_NO_RELOAD, ""),
 CF_ABS("client_tls_cert_file", CF_STR, cf_client_tls_cert_file, CF_NO_RELOAD, ""),
 CF_ABS("client_tls_key_file", CF_STR, cf_client_tls_key_file, CF_NO_RELOAD, ""),
-CF_ABS("client_tls_protocols", CF_STR, cf_client_tls_protocols, CF_NO_RELOAD, "all"),
+CF_ABS("client_tls_protocols", CF_STR, cf_client_tls_protocols, CF_NO_RELOAD, "secure"),
 CF_ABS("client_tls_ciphers", CF_STR, cf_client_tls_ciphers, CF_NO_RELOAD, "fast"),
 CF_ABS("client_tls_dheparams", CF_STR, cf_client_tls_dheparams, CF_NO_RELOAD, "auto"),
 CF_ABS("client_tls_ecdhcurve", CF_STR, cf_client_tls_ecdhecurve, CF_NO_RELOAD, "auto"),
@@ -290,7 +298,7 @@ CF_ABS("server_tls_sslmode", CF_LOOKUP(sslmode_map), cf_server_tls_sslmode, CF_N
 CF_ABS("server_tls_ca_file", CF_STR, cf_server_tls_ca_file, CF_NO_RELOAD, ""),
 CF_ABS("server_tls_cert_file", CF_STR, cf_server_tls_cert_file, CF_NO_RELOAD, ""),
 CF_ABS("server_tls_key_file", CF_STR, cf_server_tls_key_file, CF_NO_RELOAD, ""),
-CF_ABS("server_tls_protocols", CF_STR, cf_server_tls_protocols, CF_NO_RELOAD, "all"),
+CF_ABS("server_tls_protocols", CF_STR, cf_server_tls_protocols, CF_NO_RELOAD, "secure"),
 CF_ABS("server_tls_ciphers", CF_STR, cf_server_tls_ciphers, CF_NO_RELOAD, "fast"),
 
 {NULL}
@@ -418,20 +426,20 @@ void load_config(void)
 static struct event ev_sigterm;
 static struct event ev_sigint;
 
-static void handle_sigterm(int sock, short flags, void *arg)
+static void handle_sigterm(evutil_socket_t sock, short flags, void *arg)
 {
 	log_info("got SIGTERM, fast exit");
 	/* pidfile cleanup happens via atexit() */
 	exit(1);
 }
 
-static void handle_sigint(int sock, short flags, void *arg)
+static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
 {
 	log_info("got SIGINT, shutting down");
 	if (cf_reboot)
-		fatal("takeover was in progress, going down immediately");
+		die("takeover was in progress, going down immediately");
 	if (cf_pause_mode == P_SUSPEND)
-		fatal("suspend was in progress, going down immediately");
+		die("suspend was in progress, going down immediately");
 	cf_pause_mode = P_PAUSE;
 	cf_shutdown = 1;
 }
@@ -532,7 +540,7 @@ static void go_daemon(void)
 	int pid, fd;
 
 	if (!cf_pidfile || !cf_pidfile[0])
-		fatal("daemon needs pidfile configured");
+		die("daemon needs pidfile configured");
 
 	/* don't log to stdout anymore */
 	cf_quiet = 1;
@@ -540,7 +548,7 @@ static void go_daemon(void)
 	/* send stdin, stdout, stderr to /dev/null */
 	fd = open("/dev/null", O_RDWR);
 	if (fd < 0)
-		fatal_perror("/dev/null");
+		die("could not open /dev/null: %s", strerror(errno));
 	dup2(fd, 0);
 	dup2(fd, 1);
 	dup2(fd, 2);
@@ -550,19 +558,19 @@ static void go_daemon(void)
 	/* fork new process */
 	pid = fork();
 	if (pid < 0)
-		fatal_perror("fork");
+		die("fork failed: %s", strerror(errno));
 	if (pid > 0)
 		_exit(0);
 
 	/* create new session */
 	pid = setsid();
 	if (pid < 0)
-		fatal_perror("setsid");
+		die("setsid failed: %s", strerror(errno));
 
 	/* fork again to avoid being session leader */
 	pid = fork();
 	if (pid < 0)
-		fatal_perror("fork");
+		die("fork failed: %s", strerror(errno));
 	if (pid > 0)
 		_exit(0);
 }
@@ -595,12 +603,12 @@ static void check_pidfile(void)
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return;
-		fatal_perror("could not open pidfile");
+		die("could not open pidfile '%s': %s", cf_pidfile, strerror(errno));
 	}
 	res = read(fd, buf, sizeof(buf) - 1);
 	close(fd);
 	if (res <= 0)
-		fatal_perror("could not read pidfile");
+		die("could not read pidfile '%s': %s", cf_pidfile, strerror(errno));
 
 	/* parse pid */
 	buf[res] = 0;
@@ -618,11 +626,11 @@ static void check_pidfile(void)
 	log_info("stale pidfile, removing");
 	err = unlink(cf_pidfile);
 	if (err != 0)
-		fatal_perror("could not remove stale pidfile");
+		die("could not remove stale pidfile: %s", strerror(errno));
 	return;
 
 locked_pidfile:
-	fatal("pidfile exists, another instance running?");
+	die("pidfile exists, another instance running?");
 }
 
 static void write_pidfile(void)
@@ -639,10 +647,10 @@ static void write_pidfile(void)
 
 	fd = open(cf_pidfile, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (fd < 0)
-		fatal_perror("%s", cf_pidfile);
+		die("could not open pidfile '%s': %s", cf_pidfile, strerror(errno));
 	res = safe_write(fd, buf, strlen(buf));
 	if (res < 0)
-		fatal_perror("%s", cf_pidfile);
+		die("could not write pidfile '%s': %s", cf_pidfile, strerror(errno));
 	close(fd);
 
 	/* only remove when we have it actually written */
@@ -701,7 +709,7 @@ static bool check_old_process_unix(void)
 
 	fd = socket(domain, SOCK_STREAM, 0);
 	if (fd < 0)
-		fatal_perror("cannot create socket");
+		die("could not create socket: %s", strerror(errno));
 	res = safe_connect(fd, (struct sockaddr *)&sa_un, len);
 	safe_close(fd);
 	if (res < 0)
@@ -736,7 +744,7 @@ static void takeover_part1(void)
 	void *evtmp = event_init();
 
 	if (!cf_unix_socket_dir || !*cf_unix_socket_dir)
-		fatal("cannot reboot if unix dir not configured");
+		die("cannot reboot if unix dir not configured");
 
 	takeover_init();
 	while (cf_reboot)
@@ -750,7 +758,7 @@ static void dns_setup(void)
 		return;
 	adns = adns_create_context();
 	if (!adns)
-		fatal_perror("dns setup failed");
+		die("dns setup failed");
 }
 
 static void xfree(char **ptr_p)
@@ -843,7 +851,11 @@ int main(int argc, char *argv[])
 			cf_verbose++;
 			break;
 		case 'V':
-			printf("%s\n", FULLVER);
+			printf("%s\n", PACKAGE_STRING);
+			printf("libevent %s\nadns: %s\ntls: %s\n",
+			       event_get_version(),
+			       adns_get_backend(),
+			       tls_backend_version());
 			return 0;
 		case 'd':
 			cf_daemon = 1;
@@ -855,15 +867,17 @@ int main(int argc, char *argv[])
 			arg_username = optarg;
 			break;
 		case 'h':
-			usage(0, argv[0]);
+			usage(argv[0]);
 			break;
 		default:
-			usage(1, argv[0]);
+			fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
+			exit(1);
 			break;
 		}
 	}
 	if (optind + 1 != argc) {
-		fprintf(stderr, "Need config file.  See pgbouncer -h for usage.\n");
+		fprintf(stderr, "%s: no configuration file specified\n", argv[0]);
+		fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
 		exit(1);
 	}
 	cf_config_file = xstrdup(argv[optind]);
@@ -889,7 +903,7 @@ int main(int argc, char *argv[])
 
 	/* disallow running as root */
 	if (getuid() == 0)
-		fatal("PgBouncer should not run as root");
+		die("PgBouncer should not run as root");
 
 	admin_setup();
 
@@ -904,7 +918,7 @@ int main(int argc, char *argv[])
 		}
 	} else {
 		if (check_old_process_unix())
-			fatal("unix socket is in use, cannot continue");
+			die("unix socket is in use, cannot continue");
 		check_pidfile();
 	}
 
@@ -918,7 +932,7 @@ int main(int argc, char *argv[])
 	/* initialize subsystems, order important */
 	srandom(time(NULL) ^ getpid());
 	if (!event_init())
-		fatal("event_init() failed");
+		die("event_init() failed");
 	dns_setup();
 	signal_setup();
 	janitor_setup();

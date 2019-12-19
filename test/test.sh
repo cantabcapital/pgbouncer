@@ -5,7 +5,6 @@
 
 cd $(dirname $0)
 
-export PATH=/usr/lib/postgresql/9.4/bin:$PATH
 export PGDATA=$PWD/pgdata
 export PGHOST=localhost
 export PGPORT=6667
@@ -34,7 +33,22 @@ which initdb > /dev/null || {
 }
 
 # System configuration checks
-if ! grep -q "^\"${USER}\"" userlist.txt; then
+SED_ERE_OP='-E'
+case `uname` in
+Linux)
+	SED_ERE_OP='-r'
+	;;
+esac
+
+pg_majorversion=$(initdb --version | sed -n $SED_ERE_OP 's/.* ([0-9]+).*/\1/p')
+if test $pg_majorversion -ge 10; then
+	pg_supports_scram=true
+else
+	pg_supports_scram=false
+fi
+
+# System configuration checks
+if ! grep -q "^\"${USER:=$(id -un)}\"" userlist.txt; then
 	cp userlist.txt userlist.txt.bak
 	echo "\"${USER}\" \"01234\"" >> userlist.txt
 fi
@@ -58,16 +72,14 @@ if test -n "$CAN_SUDO"; then
 	esac
 fi
 
-# System configuration checks
-SED_ERE_OP='-E'
-case `uname` in
-Linux)
-	SED_ERE_OP='-r'
-	;;
-esac
-
 stopit() {
-	test -f "$1" && { kill `head -n1 "$1"`; rm -f "$1"; }
+	local pid
+	if test -f "$1"; then
+		pid=`head -n1 "$1"`
+		kill $pid
+		while kill -0 $pid 2>/dev/null; do sleep 0.1; done
+		rm -f "$1"
+	fi
 }
 
 stopit test.pid
@@ -84,7 +96,16 @@ if [ ! -d $PGDATA ]; then
 	cat >>pgdata/postgresql.conf <<-EOF
 	log_connections = on
 	EOF
-	cat >pgdata/pg_hba.conf <<-EOF
+	if $pg_supports_scram; then
+		cat >pgdata/pg_hba.conf <<-EOF
+		local  p6   all                scram-sha-256
+		host   p6   all  127.0.0.1/32  scram-sha-256
+		host   p6   all  ::1/128       scram-sha-256
+		EOF
+	else
+		cat >pgdata/pg_hba.conf </dev/null
+	fi
+	cat >>pgdata/pg_hba.conf <<-EOF
 	local  p4   all                password
 	host   p4   all  127.0.0.1/32  password
 	host   p4   all  ::1/128       password
@@ -102,7 +123,7 @@ pgctl start
 echo "Creating databases"
 psql -X -p $PG_PORT -l | grep p0 > /dev/null || {
 	psql -X -o /dev/null -p $PG_PORT -c "create user bouncer" template1 || exit 1
-	for dbname in p0 p1 p3 p4 p5; do
+	for dbname in p0 p1 p3 p4 p5 p6; do
 		createdb -p $PG_PORT $dbname || exit 1
 	done
 }
@@ -111,12 +132,19 @@ psql -X -p $PG_PORT -d p0 -c "select * from pg_user" | grep pswcheck > /dev/null
 	echo "Creating users"
 	psql -X -o /dev/null -p $PG_PORT -c "create user pswcheck with superuser createdb password 'pgbouncer-check';" p0 || exit 1
 	psql -X -o /dev/null -p $PG_PORT -c "create user someuser with password 'anypasswd';" p0 || exit 1
-	psql -X -o /dev/null -p $PG_PORT -c "create user muser1 password 'foo';" p0 || exit 1
+	if $pg_supports_scram; then
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user muser1 password 'foo';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user muser2 password 'wrong';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user puser1 password 'foo';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user puser2 password 'wrong';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'scram-sha-256'; create user scramuser1 password 'foo';" p0 || exit 1
+	else
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = on; create user muser1 password 'foo';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = on; create user muser2 password 'wrong';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = on; create user puser1 password 'foo';" p0 || exit 1
+		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = on; create user puser2 password 'wrong';" p0 || exit 1
+	fi
 }
-
-echo "Starting bouncer"
-$BOUNCER_EXE -d $BOUNCER_INI
-sleep 1
 
 #
 #  fw hacks
@@ -180,13 +208,18 @@ admin() {
 runtest() {
 	local status
 
+	$BOUNCER_EXE -d $BOUNCER_INI
+	until psql -X -h /tmp -U pgbouncer -d pgbouncer -c "show version" 2>/dev/null 1>&2; do sleep 0.1; done
+
 	printf "`date` running $1 ... "
+	echo "# $1 begin" >>$BOUNCER_LOG
 	eval $1 >$LOGDIR/$1.log 2>&1
 	status=$?
 	if [ $status -eq 0 ]; then
 		echo "ok"
 	elif [ $status -eq 77 ]; then
 		echo "skipped"
+		status=0
 	else
 		echo "FAILED"
 		cat $LOGDIR/$1.log | sed 's/^/# /'
@@ -195,10 +228,22 @@ runtest() {
 
 	# allow background processing to complete
 	wait
-	# start with fresh config
-	kill -HUP `cat $BOUNCER_PID`
+
+	stopit test.pid
+	echo "# $1 end" >>$BOUNCER_LOG
 
 	return $status
+}
+
+# show version and --version
+test_show_version() {
+	v1=$($BOUNCER_EXE --version | head -n 1) || return 1
+	v2=$(psql -X -tAq -h /tmp -U pgbouncer -d pgbouncer -c "show version;") || return 1
+
+	echo "v1=$v1"
+	echo "v2=$v2"
+
+	test x"$v1" = x"$v2"
 }
 
 # server_lifetime
@@ -268,10 +313,10 @@ test_client_idle_timeout() {
 # server_login_retry
 test_server_login_retry() {
 	admin "set query_timeout=10"
-	admin "set server_login_retry=1"
+	admin "set server_login_retry=3"
 
-	(pgctl -m fast stop; sleep 3; pgctl start) &
-	sleep 1
+	pgctl -m fast stop
+	(sleep 1; pgctl start) &
 	psql -X -c "select now()" p0
 	rc=$?
 	wait
@@ -595,10 +640,15 @@ test_auth_user() {
 test_password_server() {
 	admin "set auth_type='trust'"
 
-	# good password
+	# good password from ini
 	psql -X -c "select 1" p4 || return 1
-	# bad password
+	# bad password from ini
 	psql -X -c "select 2" p4x && return 1
+
+	# good password from auth_file
+	psql -X -c "select 1" p4y || return 1
+	# bad password from auth_file
+	psql -X -c "select 1" p4z && return 1
 
 	return 0
 }
@@ -606,6 +656,55 @@ test_password_server() {
 # test plain-text password authentication from client to PgBouncer
 test_password_client() {
 	admin "set auth_type='plain'"
+
+	# test with users that have a plain-text password stored
+
+	# good password
+	PGPASSWORD=foo psql -X -U puser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U puser2 -c "select 2" p1 && return 1
+
+	# test with users that have an md5 password stored
+
+	# good password
+	PGPASSWORD=foo psql -X -U muser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U muser2 -c "select 2" p1 && return 1
+
+	# test with users that have a SCRAM password stored
+
+	# good password
+	PGPASSWORD=foo psql -X -U scramuser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U scramuser2 -c "select 2" p1 && return 1
+
+	admin "set auth_type='trust'"
+
+	return 0
+}
+
+# test md5 authentication from PgBouncer to PostgreSQL server
+test_md5_server() {
+	admin "set auth_type='trust'"
+
+	# good password from ini
+	psql -X -c "select 1" p5 || return 1
+	# bad password from ini
+	psql -X -c "select 2" p5x && return 1
+
+	# good password from auth_file
+	psql -X -c "select 1" p5y || return 1
+	# bad password from auth_file
+	psql -X -c "select 1" p5z && return 1
+
+	return 0
+}
+
+# test md5 authentication from client to PgBouncer
+test_md5_client() {
+	admin "set auth_type='md5'"
+
+	# test with users that have a plain-text password stored
 
 	# good password
 	PGPASSWORD=foo psql -X -U puser1 -c "select 1" p1 || return 1
@@ -624,33 +723,84 @@ test_password_client() {
 	return 0
 }
 
-# test md5 authentication from PgBouncer to PostgreSQL server
-test_md5_server() {
+# test SCRAM authentication from PgBouncer to PostgreSQL server
+test_scram_server() {
+	$pg_supports_scram || return 77
+
 	admin "set auth_type='trust'"
 
-	# good password
-	psql -X -c "select 1" p5 || return 1
-	# bad password
-	psql -X -c "select 2" p5x && return 1
+	# good password from ini
+	psql -X -c "select 1" p6 || return 1
+	# bad password from ini
+	psql -X -c "select 2" p6x && return 1
+
+	# good password from auth_file (fails: not supported with SCRAM)
+	psql -X -c "select 1" p6y && return 1
+	# bad password from auth_file
+	psql -X -c "select 1" p6z && return 1
 
 	return 0
 }
 
-# test md5 authentication from client to PgBouncer
-test_md5_client() {
-	admin "set auth_type='md5'"
+# test SCRAM authentication from client to PgBouncer
+test_scram_client() {
+	$pg_supports_scram || return 77
+
+	admin "set auth_type='scram-sha-256'"
+
+	# test with users that have a plain-text password stored
 
 	# good password
-	PGPASSWORD=foo psql -X -U muser1 -c "select 1" p1 || return 1
+	PGPASSWORD=foo psql -X -U puser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U puser2 -c "select 2" p1 && return 1
+
+	# test with users that have an md5 password stored (all fail)
+
+	# good password
+	PGPASSWORD=foo psql -X -U muser1 -c "select 1" p1 && return 1
 	# bad password
 	PGPASSWORD=wrong psql -X -U muser2 -c "select 2" p1 && return 1
 
+	# test with users that have a SCRAM password stored
+
+	# good password
+	PGPASSWORD=foo psql -X -U scramuser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U scramuser2 -c "select 2" p1 && return 1
+
+	# SCRAM should also work when auth_type is "md5"
+	admin "set auth_type='md5'"
+
+	# good password
+	PGPASSWORD=foo psql -X -U scramuser1 -c "select 1" p1 || return 1
+	# bad password
+	PGPASSWORD=wrong psql -X -U scramuser2 -c "select 2" p1 && return 1
+
 	admin "set auth_type='trust'"
+
+	return 0
+}
+
+# test all the show commands
+#
+# This test right now just runs all the commands without checking the
+# output, which would be difficult.  This at least ensures the
+# commands don't completely die.  The output can be manually eyeballed
+# in the test log file.
+test_show() {
+	for what in clients config databases fds help lists pools servers sockets active_sockets stats stats_totals stats_averages users totals mem dns_hosts dns_zones; do
+		    echo "=> show $what;"
+		    psql -X -h /tmp -U pgbouncer -d pgbouncer -c "show $what;" || return 1
+	done
+
+	psql -X -h /tmp -U pgbouncer -d pgbouncer -c "show bogus;" && return 1
 
 	return 0
 }
 
 testlist="
+test_show_version
 test_server_login_retry
 test_auth_user
 test_client_idle_timeout
@@ -676,6 +826,9 @@ test_password_server
 test_password_client
 test_md5_server
 test_md5_client
+test_scram_server
+test_scram_client
+test_show
 "
 
 if [ $# -gt 0 ]; then
@@ -687,7 +840,7 @@ for test in $testlist
 do
 	runtest $test
 	status=$?
-	if [ $status -eq 1 ]; then
+	if [ $status -ne 0 ]; then
 		total_status=1
 	fi
 done

@@ -8,7 +8,8 @@
 #include <usual/mbuf.h>
 #include <usual/socket.h>
 #include <usual/err.h>
-#include <usual/event.h>
+
+#include <event.h>
 
 int cf_tcp_keepcnt;
 int cf_tcp_keepintvl;
@@ -38,6 +39,8 @@ static const char *method2string(int method)
 		return "reject";
 	case AUTH_PAM:
 		return "pam";
+	case AUTH_SCRAM_SHA_256:
+		return "scram-sha-256";
 	default:
 		return "???";
 	}
