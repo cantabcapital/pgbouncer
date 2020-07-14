@@ -160,6 +160,7 @@ void change_client_state(PgSocket *client, SocketState newstate)
 			newstate = CL_LOGIN;
 		/* fallthrough */
 	case CL_WAITING:
+	case CL_WAITING_SLOT:
 		statlist_remove(&pool->waiting_client_list, &client->head);
 		break;
 	case CL_ACTIVE:
@@ -188,6 +189,7 @@ void change_client_state(PgSocket *client, SocketState newstate)
 		break;
 	case CL_WAITING:
 	case CL_WAITING_LOGIN:
+	case CL_WAITING_SLOT:
 		client->wait_start = get_cached_time();
 		statlist_append(&pool->waiting_client_list, &client->head);
 		break;
@@ -562,11 +564,16 @@ static void pause_client(PgSocket *client)
 /* wake client from wait */
 void activate_client(PgSocket *client)
 {
-	Assert(client->state == CL_WAITING || client->state == CL_WAITING_LOGIN);
+	Assert(client->state == CL_WAITING || client->state == CL_WAITING_LOGIN ||
+		client->state == CL_WAITING_SLOT);
+
+	if(client->state == CL_WAITING_SLOT) {
+		slog_info(client, "activate_client: finally got a connection");
+	}
 
 	Assert(client->wait_start > 0);
 
-	/* acount for time client spent waiting for server */
+	/* account for time client spent waiting for server */
 	client->pool->stats.wait_time += (get_cached_time() - client->wait_start);
 
 	slog_debug(client, "activate_client");
@@ -922,6 +929,7 @@ void disconnect_client(PgSocket *client, bool notify, const char *reason, ...)
 		}
 	case CL_WAITING:
 	case CL_WAITING_LOGIN:
+	case CL_WAITING_SLOT:
 	case CL_CANCEL:
 		break;
 	default:
@@ -1125,8 +1133,8 @@ bool evict_user_connection(PgUser *user)
 	return false;
 }
 
-/* the pool needs new connection, if possible */
-void launch_new_connection(PgPool *pool)
+/* the pool needs new connection, if possible. */
+enum LaunchResult launch_new_connection(PgPool *pool)
 {
 	PgSocket *server;
 	int max;
@@ -1134,7 +1142,7 @@ void launch_new_connection(PgPool *pool)
 	/* allow only small number of connection attempts at a time */
 	if (!statlist_empty(&pool->new_server_list)) {
 		log_debug("launch_new_connection: already progress");
-		return;
+		return LAUNCH_THROTTLED;
 	}
 
 	/* if server bounces, don't retry too fast */
@@ -1143,7 +1151,7 @@ void launch_new_connection(PgPool *pool)
 		if (now - pool->last_connect_time < cf_server_login_retry) {
 			log_debug("launch_new_connection: last failed, not launching new connection yet, still waiting %" PRIu64 " s",
 				  (cf_server_login_retry - (now - pool->last_connect_time)) / USEC);
-			return;
+			return LAUNCH_RETRY_WAIT;
 		}
 	}
 
@@ -1163,7 +1171,7 @@ void launch_new_connection(PgPool *pool)
 		}
 		log_debug("launch_new_connection: pool full (%d >= %d)",
 				max, pool->db->pool_size);
-		return;
+		return LAUNCH_POOL_FULL;
 	}
 
 allow_new:
@@ -1178,7 +1186,7 @@ allow_new:
 		if (pool->db->connection_count >= max) {
 			log_debug("launch_new_connection: database '%s' full (%d >= %d)",
 				  pool->db->name, pool->db->connection_count, max);
-			return;
+			return LAUNCH_DATABASE_FULL;
 		}
 	}
 
@@ -1193,7 +1201,7 @@ allow_new:
 		if (pool->user->connection_count >= max) {
 			log_debug("launch_new_connection: user '%s' full (%d >= %d)",
 				  pool->user->name, pool->user->connection_count, max);
-			return;
+			return LAUNCH_USER_FULL;
 		}
 	}
 
@@ -1201,7 +1209,7 @@ allow_new:
 	server = slab_alloc(server_cache);
 	if (!server) {
 		log_debug("launch_new_connection: no memory");
-		return;
+		return LAUNCH_OUT_OF_MEMORY;
 	}
 
 	/* initialize it */
@@ -1214,6 +1222,7 @@ allow_new:
 	pool->user->connection_count++;
 
 	dns_connect(server);
+	return LAUNCH_SUCCESS;
 }
 
 /* new client connection attempt */
